@@ -1,6 +1,6 @@
-# Samsung 300K Tool for Unix-like Systems
+# Samsung 300K Tool for GNU/Linux Systems
 
-A lightweight, copyleft C utility designed for **Linux** and **macOS** that forces connected Samsung Galaxy devices into **Download Mode (Odin)** via AT commands over USB serial interfaces (`/dev/ttyACM*` or `/dev/tty.usbmodem*`).
+A lightweight, copyleft C utility designed for **Linux** that forces connected Samsung Galaxy devices into **Download Mode (Odin)** via AT commands over USB serial interfaces (`/dev/ttyACM*` or `/dev/tty.usbmodem*`).
 
 This project serves as a native, fully open-source alternative to the Windows-based Samsung 300K Tool. It is a vital lifesaver for devices with broken physical buttons (Volume Down / Power / Home).
 
@@ -15,8 +15,17 @@ This project serves as a native, fully open-source alternative to the Windows-ba
 
 - A C compiler (**GCC** or **Clang**)
 - **CMake** (version 3.10 or higher)
-- A Unix-like Operating System (Linux distributions or macOS)
+- A GNU/Linux operating system
 - **Root privileges** (required to read/write directly to hardware device descriptors under `/dev/`)
+
+## Platform support
+
+**Linux only.** The tool reads the USB vendor ID from
+`/sys/class/tty/<dev>/device/../idVendor` to make sure it only
+talks to Samsung devices (VID `04e8`). This mechanism is
+Linux-specific, so macOS, BSD, and Windows are not supported.
+
+On Windows, use the original Samsung 300K Tool instead.
 
 ## 🛠️ Installation & Compilation
 
