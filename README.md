@@ -44,13 +44,13 @@ Follow these clean standard steps to build the utility using CMake:
 ## 📱 How to Use
 
 1. Connect your Samsung device to your machine using a reliable USB cable.
-2. **Important:** Ensure the phone is fully booted up and the screen is **unlocked** (on the home screen), otherwise the Android subsystem will reject system-altering AT commands.
+2. **Important:** The device must have USB Debugging enabled in Developer Options. Ensure the device is fully booted up and the screen is **unlocked** (on the home screen), otherwise the Android subsystem will reject system-altering AT commands.
 3. Launch the tool with superuser permissions:
    ```bash
    sudo ./samsung-300k-tool
    # Or simply 'sudo samsung-300k-tool' if you installed it globally
    ```
-4. Verify the detected port, then press **`[ENTER]`** to initiate the sequence. The phone will instantly reboot into the bright blue/turquoise Download Mode screen.
+4. Verify the detected port, then press **`[ENTER]`** to initiate the sequence. The device will instantly reboot into the bright blue/turquoise Download Mode screen.
 
 ## 🤝 Contributing & Copyleft Compliance
 
