@@ -19,6 +19,8 @@
 #include <glob.h>
 #include <errno.h>
 #include <limits.h>
+#include <dirent.h>
+#include <signal.h>
 
 /* ---- Platform guard ---------------------------------------------------- */
 
@@ -32,6 +34,9 @@
 /* Samsung USB Vendor ID. sysfs reports it lowercase, without 0x. */
 #define SAMSUNG_VID "04e8"
 
+/* How long to wait for the device to re-enumerate in Download Mode. */
+#define DOWNLOAD_MODE_TIMEOUT_S 30
+
 /* Common patterns for USB serial modem ports on Linux. */
 static const char *PORT_PATTERNS[] = {
     "/dev/ttyACM*",  /* Linux: standard CDC/ACM USB modems */
@@ -39,15 +44,20 @@ static const char *PORT_PATTERNS[] = {
     NULL
 };
 
+/* ---- Signal handling --------------------------------------------------- */
+
+static volatile sig_atomic_t g_abort = 0;
+
+static void on_sigint(int sig) {
+    (void)sig;
+    g_abort = 1;
+}
+
 /* ---- Helpers ----------------------------------------------------------- */
 
 /*
  * Check whether the tty device at `devpath` belongs to a Samsung device
  * by reading its USB vendor ID from sysfs.
- *
- * For /dev/ttyACM0 we try:
- *   /sys/class/tty/ttyACM0/device/../idVendor
- *   /sys/class/tty/ttyACM0/device/idVendor
  *
  * Returns:
  *   1  -> matches Samsung VID
@@ -83,6 +93,104 @@ static int is_samsung_port(const char *devpath) {
 }
 
 /*
+ * Scan sysfs for a Samsung device in Download Mode (Odin).
+ * Known Download Mode PIDs: 685d, 685e, 6860 (non-exhaustive).
+ *
+ * Returns 1 if found (and writes the PID into pid_out), 0 otherwise.
+ */
+static int detect_download_mode(char *pid_out, size_t pid_sz) {
+    DIR *d = opendir("/sys/bus/usb/devices");
+    if (!d) return 0;
+
+    struct dirent *ent;
+    int found = 0;
+
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+
+        char path[PATH_MAX];
+        char vid[16] = {0};
+        char pid[16] = {0};
+
+        snprintf(path, sizeof(path),
+                 "/sys/bus/usb/devices/%s/idVendor", ent->d_name);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        if (fscanf(f, "%15s", vid) != 1) { fclose(f); continue; }
+        fclose(f);
+
+        if (strcasecmp(vid, SAMSUNG_VID) != 0) continue;
+
+        snprintf(path, sizeof(path),
+                 "/sys/bus/usb/devices/%s/idProduct", ent->d_name);
+        f = fopen(path, "r");
+        if (!f) continue;
+        if (fscanf(f, "%15s", pid) != 1) { fclose(f); continue; }
+        fclose(f);
+
+        if (strcasecmp(pid, "685d") == 0 ||
+            strcasecmp(pid, "685e") == 0 ||
+            strcasecmp(pid, "6860") == 0) {
+            if (pid_out && pid_sz) {
+                snprintf(pid_out, pid_sz, "%s", pid);
+            }
+            found = 1;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+/*
+ * Wait for the device to re-enumerate in Download Mode.
+ * Polls sysfs every 500 ms. Aborts on Ctrl+C.
+ *
+ * Returns:
+ *   1 -> Download Mode detected (pid_out filled)
+ *   0 -> aborted by user
+ *  -1 -> timed out without detection
+ */
+static int wait_for_download_mode(char *pid_out, size_t pid_sz,
+                                  int timeout_seconds) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;  /* no SA_RESTART: let usleep be interrupted */
+
+    struct sigaction old_sa;
+    sigaction(SIGINT, &sa, &old_sa);
+
+    g_abort = 0;
+
+    int elapsed_ms = 0;
+    const int step_ms = 500;
+    const int timeout_ms = timeout_seconds * 1000;
+
+    printf("[*] Waiting for Download Mode device (up to %d s, "
+           "Ctrl+C to abort)...\n", timeout_seconds);
+
+    while (elapsed_ms < timeout_ms) {
+        if (g_abort) {
+            sigaction(SIGINT, &old_sa, NULL);
+            return 0;
+        }
+
+        if (detect_download_mode(pid_out, pid_sz)) {
+            sigaction(SIGINT, &old_sa, NULL);
+            return 1;
+        }
+
+        usleep(step_ms * 1000);
+        elapsed_ms += step_ms;
+    }
+
+    sigaction(SIGINT, &old_sa, NULL);
+    return -1;
+}
+
+/*
  * Configure the serial port: 115200 8N1, raw mode, no flow control,
  * non-blocking read with a short inter-byte timeout.
  */
@@ -95,7 +203,6 @@ static int configure_port(int fd) {
     cfsetospeed(&tty, B115200);
     cfsetispeed(&tty, B115200);
 
-    /* 8N1, enable receiver, ignore modem control lines */
     tty.c_cflag &= ~CSIZE;
     tty.c_cflag |= CS8;
     tty.c_cflag |= (CLOCAL | CREAD);
@@ -103,18 +210,14 @@ static int configure_port(int fd) {
     tty.c_cflag &= ~CSTOPB;
     tty.c_cflag &= ~CRTSCTS;
 
-    /* Raw input: no CR/NL translation, no software flow control */
     tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP
                      | INLCR | IGNCR | ICRNL
                      | IXON | IXOFF | IXANY);
 
-    /* Raw output */
     tty.c_oflag &= ~OPOST;
 
-    /* Raw local mode */
     tty.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
 
-    /* Non-blocking read, 200 ms inter-byte timeout */
     tty.c_cc[VMIN]  = 0;
     tty.c_cc[VTIME] = 2;
 
@@ -128,7 +231,7 @@ static int configure_port(int fd) {
 
 /*
  * Send an AT command followed by CRLF, wait briefly, then drain any
- * response from the modem. Returns 0 on success, -1 on write error.
+ * response. Returns 0 on success, -1 on write error (errno set).
  */
 static int send_at_command(int fd, const char *cmd) {
     char buf[128];
@@ -141,10 +244,8 @@ static int send_at_command(int fd, const char *cmd) {
         return -1;
     }
 
-    /* Give the modem a moment to ingest the bytes */
     usleep(150000);
 
-    /* Drain incoming data without blocking forever */
     memset(buf, 0, sizeof(buf));
     int guard = 0;
     while (guard++ < 32) {
@@ -155,9 +256,7 @@ static int send_at_command(int fd, const char *cmd) {
 }
 
 /*
- * Scan the known device patterns and return a strdup'd path to the first
- * port whose sysfs idVendor matches Samsung. Returns NULL if none found.
- *
+ * Return a strdup'd path to the first Samsung serial port found.
  * Ports whose VID cannot be determined are skipped (safe default).
  */
 static char *find_samsung_port(void) {
@@ -230,7 +329,7 @@ int main(void) {
         return 1;
     }
 
-    /* Payload sequence. Stop early if the port dies. */
+    /* Payload sequence. */
     const char *seq[] = {
         "AT",
         "AT",
@@ -242,19 +341,92 @@ int main(void) {
         NULL
     };
 
+    int sent_any = 0;
+
     for (int i = 0; seq[i] != NULL; i++) {
         if (send_at_command(fd, seq[i]) < 0) {
-            fprintf(stderr, "[-] Write failed while sending '%s': %s\n",
-                    seq[i], strerror(errno));
+            int is_disconnect = (errno == EIO ||
+                                 errno == ENODEV ||
+                                 errno == ENOENT);
+
+            if (is_disconnect && sent_any) {
+                /*
+                 * The phone left the bus after at least one successful
+                 * command. That's almost certainly Download Mode.
+                 */
+                printf("[+] Port disappeared after '%s' (%s).\n",
+                       seq[i], strerror(errno));
+                printf("[+] This probably means the phone restarted "
+                       "into Download Mode.\n");
+
+                char pid[16] = {0};
+                int r = wait_for_download_mode(pid, sizeof(pid),
+                                               DOWNLOAD_MODE_TIMEOUT_S);
+
+                if (r == 1) {
+                    printf("[+] Confirmed: device is in Download Mode "
+                           "(04e8:%s).\n", pid);
+                    close(fd);
+                    free(port_name);
+                    return 0;
+                } else if (r == 0) {
+                    printf("[!] Aborted by user. The phone probably "
+                           "rebooted into Download Mode anyway.\n");
+                    printf("    Check with: lsusb | grep 04e8\n");
+                    close(fd);
+                    free(port_name);
+                    return 0;  /* port disappeared, still success */
+                } else {
+                    printf("[-] Timed out after %d s: no Download Mode "
+                           "device detected.\n",
+                           DOWNLOAD_MODE_TIMEOUT_S);
+                    printf("    The phone may have failed to enter "
+                           "Download Mode.\n");
+                    printf("    Check with: lsusb | grep 04e8\n");
+                    close(fd);
+                    free(port_name);
+                    return 1;
+                }
+            }
+
+            if (is_disconnect) {
+                fprintf(stderr, "[-] Port not usable (%s). "
+                        "Check cable, driver, and permissions.\n",
+                        strerror(errno));
+            } else {
+                fprintf(stderr, "[-] Write failed while sending '%s': %s\n",
+                        seq[i], strerror(errno));
+            }
             close(fd);
             free(port_name);
             return 1;
         }
+        sent_any = 1;
     }
 
+    /*
+     * Full sequence sent without the port disappearing. On some models
+     * (e.g. S8) the phone re-enumerates a few seconds after AT+REBOOT=4
+     * rather than mid-sequence, so give it a chance to show up.
+     */
     printf("[+] Done! The device should now reboot into Download Mode.\n");
+
+    char pid[16] = {0};
+    int r = wait_for_download_mode(pid, sizeof(pid),
+                                   DOWNLOAD_MODE_TIMEOUT_S);
+
+    if (r == 1) {
+        printf("[+] Confirmed: device is in Download Mode "
+               "(04e8:%s).\n", pid);
+    } else if (r == 0) {
+        printf("[!] Aborted by user.\n");
+    } else {
+        printf("[?] No Download Mode device detected within %d s.\n",
+               DOWNLOAD_MODE_TIMEOUT_S);
+        printf("    Check with: lsusb | grep 04e8\n");
+    }
 
     close(fd);
     free(port_name);
-    return 0;
+    return 0;  /* sequence completed; phone should be rebooting */
 }
