@@ -33,7 +33,7 @@ Follow these clean standard steps to build the utility using CMake:
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/alexjune1206-maker/samsung-300k-tool-4-linux
+   git clone https://github.com/alexjune1206-maker/samsung-300k-tool-4-linux.git
    cd samsung-300k-tool-4-linux
    ```
 
