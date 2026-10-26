@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.2.0] - 2026-10-26
+
+### Added
+- `--help` / `-h` flag with usage, author, GitHub, and contact info.
+- `--version` / `-V` flag.
+- `--dry-run` / `-n` flag: detect devices and show the AT sequence
+  without sending anything.
+- `--verbose` / `-v` flag: print modem responses for each command.
+- `--timeout SEC` / `-t` flag: configurable Download Mode timeout
+  (1-600 s, default 30 s).
+- Banner with version and author when stdout is a TTY.
+
+### Changed
+- Version is now sourced from CMake's `PROJECT_VERSION` via
+  `TOOL_VERSION_CMAKE`, so `--version` stays in sync with the build.
+- Install destination uses a relative `bin` path, respecting
+  `CMAKE_INSTALL_PREFIX`.
+
 ## [1.1.0] - 2026-10-19
 
 ### Added

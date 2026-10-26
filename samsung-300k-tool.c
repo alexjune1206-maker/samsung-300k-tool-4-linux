@@ -22,6 +22,7 @@
 #include <dirent.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <getopt.h>
 
 /* ---- Platform guard ---------------------------------------------------- */
 
@@ -32,6 +33,22 @@
 #error "This tool supports Linux only (sysfs required for Samsung VID detection)."
 #endif
 
+/* ---- Metadata ---------------------------------------------------------- */
+
+/* TOOL_VERSION_CMAKE is injected by CMakeLists.txt from PROJECT_VERSION.
+ * When building manually with gcc, fall back to a hardcoded value. */
+#ifdef TOOL_VERSION_CMAKE
+#define TOOL_VERSION TOOL_VERSION_CMAKE
+#else
+#define TOOL_VERSION "1.2.0"
+#endif
+
+#define TOOL_AUTHOR  "alexjune1206-maker"
+#define TOOL_GITHUB  "https://github.com/alexjune1206-maker"
+#define TOOL_CONTACT "alexjune1206@gmail.com"
+
+/* ---- Defaults ---------------------------------------------------------- */
+
 #define SAMSUNG_VID "04e8"
 #define DOWNLOAD_MODE_TIMEOUT_S 30
 #define MAX_PORTS 16
@@ -41,6 +58,14 @@ static const char *PORT_PATTERNS[] = {
     "/dev/ttyACM*",
     "/dev/ttyUSB*",
     NULL
+};
+
+/* ---- Options ----------------------------------------------------------- */
+
+struct options {
+    int dry_run;
+    int verbose;
+    int timeout;
 };
 
 /* ---- Port list --------------------------------------------------------- */
@@ -66,6 +91,47 @@ static volatile sig_atomic_t g_abort = 0;
 static void on_sigint(int sig) {
     (void)sig;
     g_abort = 1;
+}
+
+/* ---- Usage / version --------------------------------------------------- */
+
+static void print_usage(const char *prog) {
+    printf("Usage: %s [OPTIONS]\n", prog);
+    printf("\n");
+    printf("Force connected Samsung Galaxy devices into Download Mode\n");
+    printf("(Odin) via AT commands over USB serial interfaces.\n");
+    printf("\n");
+    printf("Options:\n");
+    printf("  -h, --help           Show this help and exit\n");
+    printf("  -n, --dry-run        Detect devices and show the AT sequence\n");
+    printf("                       without sending anything\n");
+    printf("  -v, --verbose        Print modem responses for each command\n");
+    printf("  -t, --timeout SEC    Seconds to wait for Download Mode\n");
+    printf("                       (default: %d)\n", DOWNLOAD_MODE_TIMEOUT_S);
+    printf("  -V, --version        Show version and exit\n");
+    printf("\n");
+    printf("Exit status:\n");
+    printf("  0  success (all selected devices entered Download Mode)\n");
+    printf("  1  failure (no device, or at least one device failed)\n");
+    printf("  2  invalid command-line usage\n");
+    printf("\n");
+    printf("Examples:\n");
+    printf("  %s                     # interactive menu\n", prog);
+    printf("  %s --dry-run           # see what would happen\n", prog);
+    printf("  %s --timeout 60        # wait longer for slow bootloaders\n", prog);
+    printf("\n");
+    printf("Requires root (sudo) to access /dev/ttyACM* and /sys.\n");
+    printf("\n");
+    printf("Made by %s\n", TOOL_AUTHOR);
+    printf("GitHub:  %s\n", TOOL_GITHUB);
+    printf("Contact: %s\n", TOOL_CONTACT);
+}
+
+static void print_version(void) {
+    printf("samsung-300k-tool %s\n", TOOL_VERSION);
+    printf("Made by %s\n", TOOL_AUTHOR);
+    printf("GitHub:  %s\n", TOOL_GITHUB);
+    printf("Contact: %s\n", TOOL_CONTACT);
 }
 
 /* ---- sysfs helpers ----------------------------------------------------- */
@@ -268,11 +334,13 @@ static int configure_port(int fd) {
     return 0;
 }
 
-static int send_at_command(int fd, const char *cmd) {
+static int send_at_command(int fd, const char *cmd, int verbose) {
     char buf[128];
     int len = snprintf(buf, sizeof(buf), "%s\r\n", cmd);
     if (len < 0) return -1;
     if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
+
+    if (verbose) printf("  >> %s\n", cmd);
 
     ssize_t w = write(fd, buf, (size_t)len);
     if (w != (ssize_t)len) return -1;
@@ -284,6 +352,14 @@ static int send_at_command(int fd, const char *cmd) {
     while (guard++ < 32) {
         ssize_t r = read(fd, buf, sizeof(buf) - 1);
         if (r <= 0) break;
+        if (verbose && r > 0) {
+            buf[r] = '\0';
+            char *line = strtok(buf, "\r\n");
+            while (line) {
+                if (*line) printf("  << %s\n", line);
+                line = strtok(NULL, "\r\n");
+            }
+        }
     }
     return 0;
 }
@@ -381,10 +457,29 @@ static int select_device(const struct port_list *pl) {
 
 /* ---- Device processing ------------------------------------------------- */
 
-static int process_device(const char *port_name, const char *hw_serial) {
+static int process_device(const char *port_name, const char *hw_serial,
+                          const struct options *opt) {
     printf("\n=== Processing %s (serial: %s) ===\n",
            port_name,
            (hw_serial && hw_serial[0]) ? hw_serial : "unknown");
+
+    const char *serial_arg =
+        (hw_serial && strcmp(hw_serial, "unknown") != 0) ? hw_serial : NULL;
+
+    const char *seq[] = {
+        "AT", "AT", "AT+FUS?", "ATE0",
+        "AT+FUN=9,0", "AT+PFALS=0", "AT+REBOOT=4", NULL
+    };
+
+    if (opt->dry_run) {
+        printf("[*] Dry-run: would send the following AT sequence:\n");
+        for (int i = 0; seq[i] != NULL; i++) {
+            printf("    %s\n", seq[i]);
+        }
+        printf("[*] Dry-run: would wait up to %d s for Download Mode.\n",
+               opt->timeout);
+        return 0;
+    }
 
     int fd = open(port_name, O_RDWR | O_NOCTTY);
     if (fd < 0) {
@@ -400,18 +495,10 @@ static int process_device(const char *port_name, const char *hw_serial) {
         return 1;
     }
 
-    const char *seq[] = {
-        "AT", "AT", "AT+FUS?", "ATE0",
-        "AT+FUN=9,0", "AT+PFALS=0", "AT+REBOOT=4", NULL
-    };
-
-    const char *serial_arg =
-        (hw_serial && strcmp(hw_serial, "unknown") != 0) ? hw_serial : NULL;
-
     int sent_any = 0;
 
     for (int i = 0; seq[i] != NULL; i++) {
-        if (send_at_command(fd, seq[i]) < 0) {
+        if (send_at_command(fd, seq[i], opt->verbose) < 0) {
             int is_disconnect = (errno == EIO ||
                                  errno == ENODEV ||
                                  errno == ENOENT);
@@ -423,7 +510,7 @@ static int process_device(const char *port_name, const char *hw_serial) {
                 char pid[16] = {0};
                 int r = wait_for_download_mode(serial_arg,
                                                pid, sizeof(pid),
-                                               DOWNLOAD_MODE_TIMEOUT_S);
+                                               opt->timeout);
 
                 if (r == 1) {
                     printf("[+] Confirmed %s in Download Mode "
@@ -458,7 +545,7 @@ static int process_device(const char *port_name, const char *hw_serial) {
 
     char pid[16] = {0};
     int r = wait_for_download_mode(serial_arg, pid, sizeof(pid),
-                                   DOWNLOAD_MODE_TIMEOUT_S);
+                                   opt->timeout);
 
     if (r == 1) {
         printf("[+] Confirmed %s in Download Mode (04e8:%s).\n",
@@ -472,14 +559,76 @@ static int process_device(const char *port_name, const char *hw_serial) {
     }
 
     printf("[?] No Download Mode detected for %s within %d s.\n",
-           port_name, DOWNLOAD_MODE_TIMEOUT_S);
+           port_name, opt->timeout);
     close(fd);
     return 1;
 }
 
 /* ---- main -------------------------------------------------------------- */
 
-int main(void) {
+int main(int argc, char **argv) {
+    struct options opt = {
+        .dry_run = 0,
+        .verbose = 0,
+        .timeout = DOWNLOAD_MODE_TIMEOUT_S,
+    };
+
+    static struct option long_opts[] = {
+        {"help",    no_argument,       0, 'h'},
+        {"dry-run", no_argument,       0, 'n'},
+        {"verbose", no_argument,       0, 'v'},
+        {"timeout", required_argument, 0, 't'},
+        {"version", no_argument,       0, 'V'},
+        {0, 0, 0, 0}
+    };
+
+    int c;
+    while ((c = getopt_long(argc, argv, "hnvt:V", long_opts, NULL)) != -1) {
+        switch (c) {
+            case 'h':
+                print_usage(argv[0]);
+                return 0;
+            case 'n':
+                opt.dry_run = 1;
+                break;
+            case 'v':
+                opt.verbose = 1;
+                break;
+            case 't': {
+                char *end = NULL;
+                long n = strtol(optarg, &end, 10);
+                if (end == optarg || *end != '\0' || n < 1 || n > 600) {
+                    fprintf(stderr, "Error: invalid timeout '%s' "
+                            "(expected 1-600 seconds)\n", optarg);
+                    return 2;
+                }
+                opt.timeout = (int)n;
+                break;
+            }
+            case 'V':
+                print_version();
+                return 0;
+            case '?':
+                fprintf(stderr, "Try '%s --help' for more information.\n",
+                        argv[0]);
+                return 2;
+            default:
+                return 2;
+        }
+    }
+
+    if (optind < argc) {
+        fprintf(stderr, "Error: unexpected argument '%s'\n", argv[optind]);
+        fprintf(stderr, "Try '%s --help' for more information.\n", argv[0]);
+        return 2;
+    }
+
+    /* Banner only when stdout is a TTY, to avoid polluting pipes. */
+    if (isatty(STDOUT_FILENO)) {
+        printf("samsung-300k-tool %s by %s\n\n",
+               TOOL_VERSION, TOOL_AUTHOR);
+    }
+
     printf("[*] Searching for connected Samsung devices...\n");
 
     struct port_list pl;
@@ -499,11 +648,13 @@ int main(void) {
         return 0;
     }
 
-    printf("\n[*] Press [ENTER] to reboot into Download Mode, "
-           "or [Ctrl+C] to abort...\n");
-    if (getchar() == EOF) {
-        free_port_list(&pl);
-        return 1;
+    if (!opt.dry_run) {
+        printf("\n[*] Press [ENTER] to reboot into Download Mode, "
+               "or [Ctrl+C] to abort...\n");
+        if (getchar() == EOF) {
+            free_port_list(&pl);
+            return 1;
+        }
     }
 
     int success = 0;
@@ -520,7 +671,7 @@ int main(void) {
             fflush(stdout);
             pid_t pid = fork();
             if (pid == 0) {
-                int rc = process_device(pl.paths[i], pl.serials[i]);
+                int rc = process_device(pl.paths[i], pl.serials[i], &opt);
                 fflush(stdout);
                 _exit(rc);
             } else if (pid > 0) {
@@ -541,7 +692,7 @@ int main(void) {
             }
         }
     } else {
-        if (process_device(pl.paths[sel], pl.serials[sel]) == 0) success++;
+        if (process_device(pl.paths[sel], pl.serials[sel], &opt) == 0) success++;
         else failed++;
     }
 
