@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.2.1] - 2026-10-26
+
+### Fixed
+- Retry the first `AT` command once if the port returns `EIO`.
+- Clearer error message when `--timeout` is given without a value.
+
+### Changed
+- Hardware serial is reported as `unavailable` instead of `unknown`.
+
 ## [1.2.0] - 2026-10-26
 
 ### Added

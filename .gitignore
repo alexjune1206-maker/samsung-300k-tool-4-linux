@@ -1,3 +1,11 @@
 # Add build folder
 
 build
+
+# Add build script for all arches
+
+build_all.sh
+
+# Add binaries folder
+
+binaries

@@ -35,12 +35,10 @@
 
 /* ---- Metadata ---------------------------------------------------------- */
 
-/* TOOL_VERSION_CMAKE is injected by CMakeLists.txt from PROJECT_VERSION.
- * When building manually with gcc, fall back to a hardcoded value. */
 #ifdef TOOL_VERSION_CMAKE
 #define TOOL_VERSION TOOL_VERSION_CMAKE
 #else
-#define TOOL_VERSION "1.2.0"
+#define TOOL_VERSION "1.2.1"
 #endif
 
 #define TOOL_AUTHOR  "alexjune1206-maker"
@@ -114,13 +112,6 @@ static void print_usage(const char *prog) {
     printf("  0  success (all selected devices entered Download Mode)\n");
     printf("  1  failure (no device, or at least one device failed)\n");
     printf("  2  invalid command-line usage\n");
-    printf("\n");
-    printf("Examples:\n");
-    printf("  %s                     # interactive menu\n", prog);
-    printf("  %s --dry-run           # see what would happen\n", prog);
-    printf("  %s --timeout 60        # wait longer for slow bootloaders\n", prog);
-    printf("\n");
-    printf("Requires root (sudo) to access /dev/ttyACM* and /sys.\n");
     printf("\n");
     printf("Made by %s\n", TOOL_AUTHOR);
     printf("GitHub:  %s\n", TOOL_GITHUB);
@@ -398,7 +389,7 @@ static void find_samsung_ports(struct port_list *pl) {
             if (get_usb_serial(path, pl->serials[idx],
                                sizeof(pl->serials[idx])) != 0) {
                 snprintf(pl->serials[idx], sizeof(pl->serials[idx]),
-                         "unknown");
+                         "unavailable");
             }
 
             pl->count++;
@@ -461,10 +452,10 @@ static int process_device(const char *port_name, const char *hw_serial,
                           const struct options *opt) {
     printf("\n=== Processing %s (serial: %s) ===\n",
            port_name,
-           (hw_serial && hw_serial[0]) ? hw_serial : "unknown");
+           (hw_serial && hw_serial[0]) ? hw_serial : "unavailable");
 
     const char *serial_arg =
-        (hw_serial && strcmp(hw_serial, "unknown") != 0) ? hw_serial : NULL;
+        (hw_serial && strcmp(hw_serial, "unavailable") != 0) ? hw_serial : NULL;
 
     const char *seq[] = {
         "AT", "AT", "AT+FUS?", "ATE0",
@@ -502,6 +493,16 @@ static int process_device(const char *port_name, const char *hw_serial,
             int is_disconnect = (errno == EIO ||
                                  errno == ENODEV ||
                                  errno == ENOENT);
+
+            /* Fix: retry the first AT once if the port is still
+             * initializing and returns EIO. */
+            if (is_disconnect && !sent_any) {
+                usleep(500000);
+                if (send_at_command(fd, seq[i], opt->verbose) == 0) {
+                    sent_any = 1;
+                    continue;
+                }
+            }
 
             if (is_disconnect && sent_any) {
                 printf("[+] Port disappeared after '%s' (%s).\n",
@@ -595,6 +596,12 @@ int main(int argc, char **argv) {
                 opt.verbose = 1;
                 break;
             case 't': {
+                /* Fix: clearer message when --timeout has no value. */
+                if (!optarg) {
+                    fprintf(stderr, "Error: --timeout requires a value "
+                            "(1-600 seconds)\n");
+                    return 2;
+                }
                 char *end = NULL;
                 long n = strtol(optarg, &end, 10);
                 if (end == optarg || *end != '\0' || n < 1 || n > 600) {
@@ -623,7 +630,6 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    /* Banner only when stdout is a TTY, to avoid polluting pipes. */
     if (isatty(STDOUT_FILENO)) {
         printf("samsung-300k-tool %s by %s\n\n",
                TOOL_VERSION, TOOL_AUTHOR);
