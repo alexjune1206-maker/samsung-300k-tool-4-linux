@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>   /* strcasecmp */
+#include <stdarg.h>    /* va_list for debug_log, log_line */
 #include <unistd.h>
 #include <fcntl.h>
 #include <termios.h>
@@ -38,7 +39,7 @@
 #ifdef TOOL_VERSION_CMAKE
 #define TOOL_VERSION TOOL_VERSION_CMAKE
 #else
-#define TOOL_VERSION "1.2.1"
+#define TOOL_VERSION "1.2.2"
 #endif
 
 #define TOOL_AUTHOR  "alexjune1206-maker"
@@ -58,12 +59,43 @@ static const char *PORT_PATTERNS[] = {
     NULL
 };
 
+/* ---- Debug logging ----------------------------------------------------- */
+
+static int g_debug = 0;
+
+static void debug_log(const char *fmt, ...) {
+    if (!g_debug) return;
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "[debug] ");
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+}
+
+/* ---- File logging ------------------------------------------------------ */
+
+static FILE *g_log = NULL;
+
+static void log_line(const char *fmt, ...) {
+    if (!g_log) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_log, fmt, ap);
+    fprintf(g_log, "\n");
+    va_end(ap);
+    fflush(g_log);
+}
+
 /* ---- Options ----------------------------------------------------------- */
 
 struct options {
     int dry_run;
     int verbose;
+    int debug;
+    int list;
     int timeout;
+    const char *log_file;
 };
 
 /* ---- Port list --------------------------------------------------------- */
@@ -104,6 +136,9 @@ static void print_usage(const char *prog) {
     printf("  -n, --dry-run        Detect devices and show the AT sequence\n");
     printf("                       without sending anything\n");
     printf("  -v, --verbose        Print modem responses for each command\n");
+    printf("  -d, --debug          Print detection details to stderr\n");
+    printf("  -l, --list           List detected devices and exit\n");
+    printf("  -L, --log FILE       Write a log of the operation to FILE\n");
     printf("  -t, --timeout SEC    Seconds to wait for Download Mode\n");
     printf("                       (default: %d)\n", DOWNLOAD_MODE_TIMEOUT_S);
     printf("  -V, --version        Show version and exit\n");
@@ -166,17 +201,24 @@ static int is_samsung_port(const char *devpath) {
         snprintf(syspath, sizeof(syspath),
                  "/sys/class/tty/%s/device/idVendor", base);
         f = fopen(syspath, "r");
-        if (!f) return -1;
+        if (!f) {
+            debug_log("%s: cannot read idVendor (%s)", devpath, syspath);
+            return -1;
+        }
     }
 
     char vid[16] = {0};
     if (fscanf(f, "%15s", vid) != 1) {
         fclose(f);
+        debug_log("%s: failed to parse idVendor", devpath);
         return -1;
     }
     fclose(f);
 
-    return (strcasecmp(vid, SAMSUNG_VID) == 0) ? 1 : 0;
+    int match = (strcasecmp(vid, SAMSUNG_VID) == 0);
+    debug_log("%s: VID=%s -> %s", devpath, vid,
+              match ? "Samsung" : "not Samsung");
+    return match ? 1 : 0;
 }
 
 /* ---- Download Mode detection ------------------------------------------- */
@@ -184,7 +226,10 @@ static int is_samsung_port(const char *devpath) {
 static int detect_download_mode_for_serial(const char *target_serial,
                                            char *pid_out, size_t pid_sz) {
     DIR *d = opendir("/sys/bus/usb/devices");
-    if (!d) return 0;
+    if (!d) {
+        debug_log("cannot open /sys/bus/usb/devices");
+        return 0;
+    }
 
     struct dirent *ent;
     int found = 0;
@@ -210,9 +255,14 @@ static int detect_download_mode_for_serial(const char *target_serial,
         if (fscanf(f, "%15s", pid) != 1) { fclose(f); continue; }
         fclose(f);
 
-        if (strcasecmp(pid, "685d") != 0 &&
-            strcasecmp(pid, "685e") != 0 &&
-            strcasecmp(pid, "6860") != 0) continue;
+        int is_dm_pid = (strcasecmp(pid, "685d") == 0 ||
+                         strcasecmp(pid, "685e") == 0 ||
+                         strcasecmp(pid, "6860") == 0);
+        if (!is_dm_pid) {
+            debug_log("usb %s: 04e8:%s -> not a Download Mode PID",
+                      ent->d_name, pid);
+            continue;
+        }
 
         if (target_serial && target_serial[0] != '\0') {
             snprintf(path, sizeof(path),
@@ -228,9 +278,15 @@ static int detect_download_mode_for_serial(const char *target_serial,
                 serial[--len] = '\0';
             }
 
-            if (strcmp(serial, target_serial) != 0) continue;
+            if (strcmp(serial, target_serial) != 0) {
+                debug_log("usb %s: 04e8:%s serial=%s (target=%s)",
+                          ent->d_name, pid, serial, target_serial);
+                continue;
+            }
         }
 
+        debug_log("usb %s: 04e8:%s -> Download Mode match",
+                  ent->d_name, pid);
         if (pid_out && pid_sz) snprintf(pid_out, pid_sz, "%s", pid);
         found = 1;
         break;
@@ -361,11 +417,14 @@ static void find_samsung_ports(struct port_list *pl) {
     pl->count = 0;
 
     for (int i = 0; PORT_PATTERNS[i] != NULL; i++) {
+        debug_log("scanning pattern: %s", PORT_PATTERNS[i]);
+
         glob_t glob_result;
         memset(&glob_result, 0, sizeof(glob_result));
 
         int rc = glob(PORT_PATTERNS[i], 0, NULL, &glob_result);
         if (rc != 0) {
+            debug_log("  no matches for %s (rc=%d)", PORT_PATTERNS[i], rc);
             globfree(&glob_result);
             continue;
         }
@@ -374,13 +433,18 @@ static void find_samsung_ports(struct port_list *pl) {
             if (pl->count >= MAX_PORTS) break;
 
             const char *path = glob_result.gl_pathv[j];
+            debug_log("  candidate: %s", path);
+
             if (is_samsung_port(path) != 1) continue;
 
             int dup = 0;
             for (int k = 0; k < pl->count; k++) {
                 if (strcmp(pl->paths[k], path) == 0) { dup = 1; break; }
             }
-            if (dup) continue;
+            if (dup) {
+                debug_log("  %s: duplicate, skipping", path);
+                continue;
+            }
 
             int idx = pl->count;
             pl->paths[idx] = strdup(path);
@@ -390,12 +454,36 @@ static void find_samsung_ports(struct port_list *pl) {
                                sizeof(pl->serials[idx])) != 0) {
                 snprintf(pl->serials[idx], sizeof(pl->serials[idx]),
                          "unavailable");
+                debug_log("  %s: serial unavailable", path);
+            } else {
+                debug_log("  %s: serial=%s", path, pl->serials[idx]);
             }
 
             pl->count++;
         }
 
         globfree(&glob_result);
+    }
+
+    debug_log("total Samsung ports found: %d", pl->count);
+}
+
+/* ---- --list output ----------------------------------------------------- */
+
+static void print_port_list(const struct port_list *pl) {
+    if (pl->count == 0) {
+        printf("No Samsung devices found.\n");
+        return;
+    }
+
+    printf("%-20s %-20s %s\n", "PORT", "SERIAL", "STATUS");
+    printf("%-20s %-20s %s\n", "----", "------", "------");
+
+    for (int i = 0; i < pl->count; i++) {
+        printf("%-20s %-20s %s\n",
+               pl->paths[i],
+               pl->serials[i],
+               "ready");
     }
 }
 
@@ -454,6 +542,9 @@ static int process_device(const char *port_name, const char *hw_serial,
            port_name,
            (hw_serial && hw_serial[0]) ? hw_serial : "unavailable");
 
+    log_line("[%s] processing, serial=%s", port_name,
+             (hw_serial && hw_serial[0]) ? hw_serial : "unavailable");
+
     const char *serial_arg =
         (hw_serial && strcmp(hw_serial, "unavailable") != 0) ? hw_serial : NULL;
 
@@ -469,6 +560,8 @@ static int process_device(const char *port_name, const char *hw_serial,
         }
         printf("[*] Dry-run: would wait up to %d s for Download Mode.\n",
                opt->timeout);
+        log_line("[%s] dry-run, %d commands would be sent",
+                 port_name, (int)(sizeof(seq)/sizeof(seq[0]) - 1));
         return 0;
     }
 
@@ -476,12 +569,14 @@ static int process_device(const char *port_name, const char *hw_serial,
     if (fd < 0) {
         fprintf(stderr, "[-] Could not open %s: %s\n",
                 port_name, strerror(errno));
+        log_line("[%s] open failed: %s", port_name, strerror(errno));
         return 1;
     }
 
     if (configure_port(fd) < 0) {
         fprintf(stderr, "[-] Failed to configure %s: %s\n",
                 port_name, strerror(errno));
+        log_line("[%s] configure failed: %s", port_name, strerror(errno));
         close(fd);
         return 1;
     }
@@ -494,8 +589,7 @@ static int process_device(const char *port_name, const char *hw_serial,
                                  errno == ENODEV ||
                                  errno == ENOENT);
 
-            /* Fix: retry the first AT once if the port is still
-             * initializing and returns EIO. */
+            /* Retry the first AT once if the port is still initializing. */
             if (is_disconnect && !sent_any) {
                 usleep(500000);
                 if (send_at_command(fd, seq[i], opt->verbose) == 0) {
@@ -507,6 +601,8 @@ static int process_device(const char *port_name, const char *hw_serial,
             if (is_disconnect && sent_any) {
                 printf("[+] Port disappeared after '%s' (%s).\n",
                        seq[i], strerror(errno));
+                log_line("[%s] port disappeared after '%s' (%s)",
+                         port_name, seq[i], strerror(errno));
 
                 char pid[16] = {0};
                 int r = wait_for_download_mode(serial_arg,
@@ -516,14 +612,19 @@ static int process_device(const char *port_name, const char *hw_serial,
                 if (r == 1) {
                     printf("[+] Confirmed %s in Download Mode "
                            "(04e8:%s).\n", port_name, pid);
+                    log_line("[%s] confirmed Download Mode 04e8:%s",
+                             port_name, pid);
                     close(fd);
                     return 0;
                 } else if (r == 0) {
                     printf("[!] Aborted by user.\n");
+                    log_line("[%s] aborted by user", port_name);
                     close(fd);
                     return 0;
                 } else {
                     printf("[-] Timed out waiting for %s.\n", port_name);
+                    log_line("[%s] timed out waiting for Download Mode",
+                             port_name);
                     close(fd);
                     return 1;
                 }
@@ -532,9 +633,13 @@ static int process_device(const char *port_name, const char *hw_serial,
             if (is_disconnect) {
                 fprintf(stderr, "[-] Port not usable (%s).\n",
                         strerror(errno));
+                log_line("[%s] port not usable: %s",
+                         port_name, strerror(errno));
             } else {
                 fprintf(stderr, "[-] Write failed on '%s': %s\n",
                         seq[i], strerror(errno));
+                log_line("[%s] write failed on '%s': %s",
+                         port_name, seq[i], strerror(errno));
             }
             close(fd);
             return 1;
@@ -543,6 +648,7 @@ static int process_device(const char *port_name, const char *hw_serial,
     }
 
     printf("[+] Sequence sent to %s.\n", port_name);
+    log_line("[%s] sequence sent", port_name);
 
     char pid[16] = {0};
     int r = wait_for_download_mode(serial_arg, pid, sizeof(pid),
@@ -551,16 +657,20 @@ static int process_device(const char *port_name, const char *hw_serial,
     if (r == 1) {
         printf("[+] Confirmed %s in Download Mode (04e8:%s).\n",
                port_name, pid);
+        log_line("[%s] confirmed Download Mode 04e8:%s", port_name, pid);
         close(fd);
         return 0;
     } else if (r == 0) {
         printf("[!] Aborted by user.\n");
+        log_line("[%s] aborted by user", port_name);
         close(fd);
         return 0;
     }
 
     printf("[?] No Download Mode detected for %s within %d s.\n",
            port_name, opt->timeout);
+    log_line("[%s] no Download Mode detected within %d s",
+             port_name, opt->timeout);
     close(fd);
     return 1;
 }
@@ -571,20 +681,26 @@ int main(int argc, char **argv) {
     struct options opt = {
         .dry_run = 0,
         .verbose = 0,
+        .debug = 0,
+        .list = 0,
         .timeout = DOWNLOAD_MODE_TIMEOUT_S,
+        .log_file = NULL,
     };
 
     static struct option long_opts[] = {
         {"help",    no_argument,       0, 'h'},
         {"dry-run", no_argument,       0, 'n'},
         {"verbose", no_argument,       0, 'v'},
+        {"debug",   no_argument,       0, 'd'},
+        {"list",    no_argument,       0, 'l'},
+        {"log",     required_argument, 0, 'L'},
         {"timeout", required_argument, 0, 't'},
         {"version", no_argument,       0, 'V'},
         {0, 0, 0, 0}
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "hnvt:V", long_opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "hnvdt:lL:V", long_opts, NULL)) != -1) {
         switch (c) {
             case 'h':
                 print_usage(argv[0]);
@@ -595,13 +711,17 @@ int main(int argc, char **argv) {
             case 'v':
                 opt.verbose = 1;
                 break;
+            case 'd':
+                opt.debug = 1;
+                g_debug = 1;
+                break;
+            case 'l':
+                opt.list = 1;
+                break;
+            case 'L':
+                opt.log_file = optarg;
+                break;
             case 't': {
-                /* Fix: clearer message when --timeout has no value. */
-                if (!optarg) {
-                    fprintf(stderr, "Error: --timeout requires a value "
-                            "(1-600 seconds)\n");
-                    return 2;
-                }
                 char *end = NULL;
                 long n = strtol(optarg, &end, 10);
                 if (end == optarg || *end != '\0' || n < 1 || n > 600) {
@@ -630,6 +750,30 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    /* Open log file if requested */
+    if (opt.log_file) {
+        g_log = fopen(opt.log_file, "w");
+        if (!g_log) {
+            fprintf(stderr, "Error: cannot open log file '%s': %s\n",
+                    opt.log_file, strerror(errno));
+            return 2;
+        }
+        log_line("samsung-300k-tool %s", TOOL_VERSION);
+        log_line("log started");
+    }
+
+    /* --list: enumerate and exit. No banner, no prompt, no commands. */
+    if (opt.list) {
+        struct port_list pl;
+        find_samsung_ports(&pl);
+        print_port_list(&pl);
+        log_line("--list: %d device(s) found", pl.count);
+        int rc = (pl.count > 0) ? 0 : 1;
+        free_port_list(&pl);
+        if (g_log) { log_line("log finished"); fclose(g_log); }
+        return rc;
+    }
+
     if (isatty(STDOUT_FILENO)) {
         printf("samsung-300k-tool %s by %s\n\n",
                TOOL_VERSION, TOOL_AUTHOR);
@@ -644,13 +788,17 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[-] No Samsung serial port detected.\n");
         fprintf(stderr, "    Make sure the phone is connected via USB cable\n");
         fprintf(stderr, "    and that you have permission to read /sys and /dev.\n");
+        log_line("no Samsung ports found");
+        if (g_log) { log_line("log finished"); fclose(g_log); }
         return 1;
     }
 
     int sel = select_device(&pl);
     if (sel == -2) {
         printf("[*] Quit.\n");
+        log_line("quit by user");
         free_port_list(&pl);
+        if (g_log) { log_line("log finished"); fclose(g_log); }
         return 0;
     }
 
@@ -659,6 +807,7 @@ int main(int argc, char **argv) {
                "or [Ctrl+C] to abort...\n");
         if (getchar() == EOF) {
             free_port_list(&pl);
+            if (g_log) { log_line("log finished"); fclose(g_log); }
             return 1;
         }
     }
@@ -669,6 +818,7 @@ int main(int argc, char **argv) {
     if (sel == -1) {
         printf("[*] Processing all %d device(s) in parallel...\n",
                pl.count);
+        log_line("processing all %d devices in parallel", pl.count);
 
         pid_t pids[MAX_PORTS];
         int npid = 0;
@@ -706,6 +856,9 @@ int main(int argc, char **argv) {
     printf("    Successful: %d\n", success);
     if (failed) printf("    Failed:     %d\n", failed);
 
+    log_line("summary: successful=%d failed=%d", success, failed);
+
     free_port_list(&pl);
+    if (g_log) { log_line("log finished"); fclose(g_log); }
     return (failed == 0) ? 0 : 1;
 }

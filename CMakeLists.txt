@@ -1,12 +1,12 @@
 cmake_minimum_required(VERSION 3.10)
 
 # Project metadata
-project(Samsung300kTool VERSION 1.2.1 LANGUAGES C)
+project(Samsung300kTool VERSION 1.2.2 LANGUAGES C)
 
 # Linux only: relies on sysfs for Samsung VID detection.
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(FATAL_ERROR
-        "Samsung300kTool4Linux isn't supported on your system. \n "
+        "Samsung300kTool4Linux isn't supported on your system.\n"
         "Detected: ${CMAKE_SYSTEM_NAME}")
 endif()
 
@@ -31,3 +31,12 @@ target_compile_definitions(samsung-300k-tool PRIVATE
 install(TARGETS samsung-300k-tool
     RUNTIME DESTINATION bin
 )
+
+# Uninstall target (does not depend on install_manifest.txt)
+if(NOT TARGET uninstall)
+    add_custom_target(uninstall
+        COMMAND ${CMAKE_COMMAND} -E remove
+                "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/bin/samsung-300k-tool"
+        COMMENT "Removing installed samsung-300k-tool"
+    )
+endif()

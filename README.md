@@ -13,6 +13,9 @@ This project serves as a native, fully open-source alternative to the Windows-ba
 - **Enhanced Payload Sequence**: Uses a robust chain of AT commands to successfully bypass security layers on newer device firmwares.
 - **Safety Safeguard**: Requires explicit user confirmation via the `[ENTER]` key before triggering the reboot (`Ctrl+C` to safely abort).
 - **Multi-device support**: Lists every Samsung device connected into a menu from which you can choose which one you want to reboot.
+- **Scripting-friendly**: `--list` prints detected devices and exits without sending commands.
+- **Debug mode**: `--debug` prints detection details to stderr, useful for new models.
+- **Logging mode**: `--log FILE` writes a log of the operation.
 
 
 ## 📋 Requirements
@@ -119,6 +122,9 @@ Options:
   -n, --dry-run        Detect devices and show the AT sequence
                        without sending anything
   -v, --verbose        Print modem responses for each command
+  -d, --debug          Print detection details to stderr
+  -l, --list           List detected devices and exit
+  -L, --log FILE       Write a log of the operation to FILE
   -t, --timeout SEC    Seconds to wait for Download Mode (1-600, default 30)
   -V, --version        Show version and exit
 ```

@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.2.2] - 2026-11-01
+
+### Added
+- `--list` / `-l` flag: list detected Samsung devices and exit.
+- `--debug` / `-d` flag: print detection details to stderr.
+- `--log FILE` / `-L` flag: write a log of the operation to FILE.
+
+### Fixed
+- `uninstall` target in CMake now works correctly.
+
 ## [1.2.1] - 2026-10-26
 
 ### Fixed
